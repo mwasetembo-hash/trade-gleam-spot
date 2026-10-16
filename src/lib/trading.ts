@@ -8,6 +8,7 @@ export type RiskLimits = {
   maxDailyLossUsd: number;
   minSpreadPct: number;
   feePct: number;
+  slippagePct: number;
   killSwitch: boolean;
 };
 
@@ -32,4 +33,21 @@ export function checkOrder(
 export function netSpreadPct(buy: number, sell: number, feePct: number): number {
   if (buy <= 0) return 0;
   return ((sell - buy) / buy) * 100 - 2 * feePct;
+}
+
+/** Cost of filling one leg of `usd` notional: exchange fee plus slippage. */
+export function fillCost(usd: number, feePct: number, slippagePct: number) {
+  const fee = usd * (feePct / 100);
+  const slip = usd * (slippagePct / 100);
+  return { fee, slip, netUsd: usd - fee - slip };
+}
+
+/** Largest peak-to-trough fall in an equity curve, in percent. */
+export function maxDrawdownPct(curve: number[]): number {
+  let peak = -Infinity, dd = 0;
+  for (const v of curve) {
+    peak = Math.max(peak, v);
+    if (peak > 0) dd = Math.max(dd, ((peak - v) / peak) * 100);
+  }
+  return dd;
 }

@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  ASSETS, VENUES, checkOrder, netSpreadPct,
+  ASSETS, VENUES, checkOrder, netSpreadPct, fillCost, maxDrawdownPct,
   type Asset, type RiskLimits, type Venue,
 } from "@/lib/trading";
 
@@ -60,7 +60,11 @@ function Console() {
   const [bal, setBal] = useState<Balances>({ USDT: 10000, BTC: 0, ETH: 0, SOL: 0, BNB: 0, XRP: 0, ADA: 0 });
   const [pnl, setPnl] = useState(0);
   const [logs, setLogs] = useState<Log[]>([]);
-  const [limits, setLimits] = useState<RiskLimits>({ maxOrderUsd: 2000, maxDailyLossUsd: 300, minSpreadPct: 0.05, feePct: 0.1, killSwitch: false });
+  const [limits, setLimits] = useState<RiskLimits>({ maxOrderUsd: 2000, maxDailyLossUsd: 300, minSpreadPct: 0.05, feePct: 0.1, slippagePct: 0.05, killSwitch: false });
+  const [stats, setStats] = useState({ trades: 0, wins: 0, fees: 0, slip: 0, rejected: 0 });
+  const record = (p: number, fee: number, slip: number) =>
+    setStats((s) => ({ ...s, trades: s.trades + 1, wins: s.wins + (p > 0 ? 1 : 0), fees: s.fees + fee, slip: s.slip + slip }));
+  const reject = () => setStats((s) => ({ ...s, rejected: s.rejected + 1 }));
   const log = (msg: string, kind: Log["kind"] = "info") =>
     setLogs((l) => [{ t: new Date().toLocaleTimeString(), msg, kind }, ...l].slice(0, 60));
 
@@ -76,12 +80,13 @@ function Console() {
     if (!(a > 0) || a > bal[from]) return log(`Insufficient ${from} balance`, "err");
     const usd = a * px(from);
     const chk = checkOrder(usd, pnl, limits);
-    if (!chk.ok) return log(`REJECTED: ${chk.reason}`, "err");
-    const fee = usd * (limits.feePct / 100);
-    const out = (usd - fee) / px(to);
+    if (!chk.ok) { reject(); return log(`REJECTED: ${chk.reason}`, "err"); }
+    const { fee, slip, netUsd } = fillCost(usd, limits.feePct, limits.slippagePct);
+    const out = netUsd / px(to);
     setBal((b) => ({ ...b, [from]: b[from] - a, [to]: b[to] + out }));
-    setPnl((p) => p - fee);
-    log(`SWAP ${fmt(a, 6)} ${from} → ${fmt(out, 6)} ${to} (fee $${fmt(fee)})`, "ok");
+    setPnl((p) => p - fee - slip);
+    record(-fee - slip, fee, slip);
+    log(`SWAP ${fmt(a, 6)} ${from} → ${fmt(out, 6)} ${to} (fee $${fmt(fee)}, slippage $${fmt(slip)})`, "ok");
   };
 
   // Arbitrage
@@ -91,19 +96,22 @@ function Console() {
       const quotes = VENUES.map((v) => ({ v, p: venuePrice(prices[a].price, v, tick, a) }));
       const buy = quotes.reduce((m, q) => (q.p < m.p ? q : m));
       const sell = quotes.reduce((m, q) => (q.p > m.p ? q : m));
-      return { a, buy, sell, net: netSpreadPct(buy.p, sell.p, limits.feePct) };
+      return { a, buy, sell, net: netSpreadPct(buy.p, sell.p, limits.feePct) - 2 * limits.slippagePct };
     }).sort((x, y) => y.net - x.net);
-  }, [prices, tick, limits.feePct]);
+  }, [prices, tick, limits.feePct, limits.slippagePct]);
 
   const [autoArb, setAutoArb] = useState(false);
   const [arbSize, setArbSize] = useState(500);
   const execArb = (o: (typeof opps)[number]) => {
     const chk = checkOrder(arbSize, pnl, limits);
-    if (!chk.ok) return log(`ARB REJECTED: ${chk.reason}`, "err");
+    if (!chk.ok) { reject(); return log(`ARB REJECTED: ${chk.reason}`, "err"); }
     if (o.net < limits.minSpreadPct) return log(`ARB SKIPPED ${o.a}: net ${fmt(o.net, 3)}% below min`, "info");
     const profit = arbSize * (o.net / 100);
+    const fee = 2 * arbSize * (limits.feePct / 100);
+    const slip = 2 * arbSize * (limits.slippagePct / 100);
     setPnl((p) => p + profit);
     setBal((b) => ({ ...b, USDT: b.USDT + profit }));
+    record(profit, fee, slip);
     log(`ARB ${o.a} buy ${o.buy.v} @${fmt(o.buy.p)} sell ${o.sell.v} @${fmt(o.sell.p)} → ${profit >= 0 ? "+" : ""}$${fmt(profit)}`, profit >= 0 ? "ok" : "err");
   };
   const lastTick = useRef(-1);
@@ -119,15 +127,22 @@ function Console() {
     if (!dca || !prices || tick % 5 !== 0) return;
     const usd = 100;
     const chk = checkOrder(usd, pnl, limits);
-    if (!chk.ok || bal.USDT < usd) return log(`DCA paused: ${chk.ok ? "low USDT" : chk.reason}`, "err");
-    const out = (usd * (1 - limits.feePct / 100)) / prices[dcaAsset].price;
+    if (!chk.ok || bal.USDT < usd) { reject(); return log(`DCA paused: ${chk.ok ? "low USDT" : chk.reason}`, "err"); }
+    const { fee, slip, netUsd } = fillCost(usd, limits.feePct, limits.slippagePct);
+    const out = netUsd / prices[dcaAsset].price;
     setBal((b) => ({ ...b, USDT: b.USDT - usd, [dcaAsset]: b[dcaAsset] + out }));
-    setPnl((p) => p - usd * (limits.feePct / 100));
+    setPnl((p) => p - fee - slip);
+    record(-fee - slip, fee, slip);
     log(`DCA bought ${fmt(out, 6)} ${dcaAsset}`, "ok");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick, dca]);
 
   const equity = (Object.keys(bal) as (Asset | "USDT")[]).reduce((s, k) => s + bal[k] * px(k), 0);
+  const [curve, setCurve] = useState<number[]>([]);
+  useEffect(() => { if (prices) setCurve((c) => [...c, equity].slice(-2000)); // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tick, prices]);
+  const dd = maxDrawdownPct(curve);
+  const lossUsedPct = Math.min(100, (Math.max(0, -pnl) / (limits.maxDailyLossUsd || 1)) * 100);
 
   // API config
   const [venue, setVenue] = useState<Venue>("Binance");
@@ -259,6 +274,7 @@ function Console() {
               ["maxDailyLossUsd", "Max daily loss ($)"],
               ["minSpreadPct", "Min arb edge (%)"],
               ["feePct", "Fee per leg (%)"],
+              ["slippagePct", "Slippage per leg (%)"],
             ] as const).map(([k, label]) => (
               <label key={k} className="flex items-center justify-between gap-2">
                 <span className="text-muted-foreground">{label}</span>
@@ -271,6 +287,34 @@ function Console() {
               onClick={() => { setLimits({ ...limits, killSwitch: !limits.killSwitch }); setAutoArb(false); setDca(false); log(limits.killSwitch ? "Kill switch released" : "KILL SWITCH ENGAGED", "err"); }}>
               {limits.killSwitch ? "Kill switch ON — release" : "Kill switch"}
             </button>
+          </div>
+        </section>
+
+        {/* Performance */}
+        <section className={panel}>
+          <h2 className={h}>Performance & risk report</h2>
+          <table className="w-full font-mono text-sm">
+            <tbody>
+              {([
+                ["Net P&L", `${pnl >= 0 ? "+" : ""}$${fmt(pnl)}`, pnl >= 0 ? "text-gain" : "text-loss"],
+                ["Return on $10k", `${fmt(((equity - 10000) / 100))}%`, equity >= 10000 ? "text-gain" : "text-loss"],
+                ["Trades filled", String(stats.trades), ""],
+                ["Win rate", stats.trades ? `${fmt((stats.wins / stats.trades) * 100, 1)}%` : "—", ""],
+                ["Fees paid", `$${fmt(stats.fees)}`, "text-loss"],
+                ["Slippage paid", `$${fmt(stats.slip)}`, "text-loss"],
+                ["Max drawdown", `${fmt(dd)}%`, dd > 5 ? "text-loss" : ""],
+                ["Orders blocked", String(stats.rejected), ""],
+              ] as const).map(([k, v, c]) => (
+                <tr key={k} className="border-t border-border">
+                  <td className="py-1 text-muted-foreground">{k}</td>
+                  <td className={`text-right ${c}`}>{v}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-4 font-mono text-xs text-muted-foreground">Daily loss limit used: {fmt(lossUsedPct, 0)}%</div>
+          <div className="mt-1 h-2 border border-border">
+            <div className={`h-full ${lossUsedPct > 75 ? "bg-destructive" : "bg-primary"}`} style={{ width: `${lossUsedPct}%` }} />
           </div>
         </section>
 
