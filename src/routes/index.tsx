@@ -1,9 +1,13 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useServerFn } from "@tanstack/react-start";
 import {
   ASSETS, VENUES, checkOrder, netSpreadPct, fillCost, maxDrawdownPct,
-  type Asset, type RiskLimits, type Venue,
+  recordTrade, emptyStrategyStats, winRatePct,
+  type Asset, type RiskLimits, type StrategyId, type StrategyStats, type Venue,
 } from "@/lib/trading";
+import { supabase } from "@/integrations/supabase/client";
+import { validateBinanceConnection, getLiveBalances, placeLiveOrder } from "@/lib/binance.functions";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -52,6 +56,12 @@ function venuePrice(base: number, v: Venue, tick: number, a: string) {
 
 const fmt = (n: number, d = 2) => n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
 
+const STRATEGY_LABELS: Record<StrategyId, string> = {
+  manual: "Manual swaps",
+  arb: "Auto arbitrage",
+  dca: "DCA auto-buy",
+};
+
 function Console() {
   const { prices, live } = usePrices();
   const [tick, setTick] = useState(0);
@@ -62,9 +72,16 @@ function Console() {
   const [logs, setLogs] = useState<Log[]>([]);
   const [limits, setLimits] = useState<RiskLimits>({ maxOrderUsd: 2000, maxDailyLossUsd: 300, minSpreadPct: 0.05, feePct: 0.1, slippagePct: 0.05, killSwitch: false });
   const [stats, setStats] = useState({ trades: 0, wins: 0, fees: 0, slip: 0, rejected: 0 });
+  const [strat, setStrat] = useState<Record<StrategyId, StrategyStats>>({
+    manual: emptyStrategyStats(), arb: emptyStrategyStats(), dca: emptyStrategyStats(),
+  });
+  const equityRef = useRef(10000);
   const record = (p: number, fee: number, slip: number) =>
     setStats((s) => ({ ...s, trades: s.trades + 1, wins: s.wins + (p > 0 ? 1 : 0), fees: s.fees + fee, slip: s.slip + slip }));
+  const recordStrat = (id: StrategyId, p: number, fee: number, slip: number) =>
+    setStrat((s) => ({ ...s, [id]: recordTrade(s[id], p, fee, slip, equityRef.current) }));
   const reject = () => setStats((s) => ({ ...s, rejected: s.rejected + 1 }));
+  // Logs never contain API keys or secrets — credentials live only on the server.
   const log = (msg: string, kind: Log["kind"] = "info") =>
     setLogs((l) => [{ t: new Date().toLocaleTimeString(), msg, kind }, ...l].slice(0, 60));
 
@@ -86,6 +103,7 @@ function Console() {
     setBal((b) => ({ ...b, [from]: b[from] - a, [to]: b[to] + out }));
     setPnl((p) => p - fee - slip);
     record(-fee - slip, fee, slip);
+    recordStrat("manual", -fee - slip, fee, slip);
     log(`SWAP ${fmt(a, 6)} ${from} → ${fmt(out, 6)} ${to} (fee $${fmt(fee)}, slippage $${fmt(slip)})`, "ok");
   };
 
@@ -112,6 +130,7 @@ function Console() {
     setPnl((p) => p + profit);
     setBal((b) => ({ ...b, USDT: b.USDT + profit }));
     record(profit, fee, slip);
+    recordStrat("arb", profit, fee, slip);
     log(`ARB ${o.a} buy ${o.buy.v} @${fmt(o.buy.p)} sell ${o.sell.v} @${fmt(o.sell.p)} → ${profit >= 0 ? "+" : ""}$${fmt(profit)}`, profit >= 0 ? "ok" : "err");
   };
   const lastTick = useRef(-1);
@@ -133,24 +152,87 @@ function Console() {
     setBal((b) => ({ ...b, USDT: b.USDT - usd, [dcaAsset]: b[dcaAsset] + out }));
     setPnl((p) => p - fee - slip);
     record(-fee - slip, fee, slip);
+    recordStrat("dca", -fee - slip, fee, slip);
     log(`DCA bought ${fmt(out, 6)} ${dcaAsset}`, "ok");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick, dca]);
 
   const equity = (Object.keys(bal) as (Asset | "USDT")[]).reduce((s, k) => s + bal[k] * px(k), 0);
+  equityRef.current = equity;
   const [curve, setCurve] = useState<number[]>([]);
   useEffect(() => { if (prices) setCurve((c) => [...c, equity].slice(-2000)); // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick, prices]);
   const dd = maxDrawdownPct(curve);
   const lossUsedPct = Math.min(100, (Math.max(0, -pnl) / (limits.maxDailyLossUsd || 1)) * 100);
 
-  // API config
-  const [venue, setVenue] = useState<Venue>("Binance");
-  const [keys, setKeys] = useState<Record<Venue, { key: string; set: boolean }>>({
-    Binance: { key: "", set: false }, Coinbase: { key: "", set: false }, Kraken: { key: "", set: false },
-  });
-  const [apiKey, setApiKey] = useState("");
-  const [apiSecret, setApiSecret] = useState("");
+  // ---- Live Binance trading ----
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [keyStatus, setKeyStatus] = useState<null | { spotTrading: boolean; withdrawalsEnabled: boolean; ipRestricted: boolean; safeToTrade: boolean }>(null);
+  const [liveBal, setLiveBal] = useState<{ asset: string; free: number; locked: number }[] | null>(null);
+  const [liveAsset, setLiveAsset] = useState<Asset>("BTC");
+  const [liveSide, setLiveSide] = useState<"BUY" | "SELL">("BUY");
+  const [liveAmt, setLiveAmt] = useState("25");
+  const [liveConfirm, setLiveConfirm] = useState(false);
+  const [liveBusy, setLiveBusy] = useState(false);
+
+  const validateFn = useServerFn(validateBinanceConnection);
+  const balancesFn = useServerFn(getLiveBalances);
+  const orderFn = useServerFn(placeLiveOrder);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setUserEmail(data.session?.user.email ?? null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setUserEmail(s?.user.email ?? null));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  const signIn = async (mode: "in" | "up") => {
+    setAuthBusy(true);
+    try {
+      const fn = mode === "in" ? supabase.auth.signInWithPassword : supabase.auth.signUp;
+      const { error } = await fn({ email, password });
+      if (error) log(`Sign ${mode} failed: ${error.message}`, "err");
+      else if (mode === "up") log("Account created — confirm the email, then sign in", "ok");
+      else log("Signed in — live trading unlocked", "ok");
+    } finally { setAuthBusy(false); }
+  };
+
+  const connectBinance = async () => {
+    setLiveBusy(true);
+    try {
+      const v = await validateFn({});
+      setKeyStatus(v);
+      if (v.withdrawalsEnabled) {
+        log("BINANCE KEY UNSAFE: withdrawals are enabled on this key. Live trading is blocked.", "err");
+      } else if (!v.spotTrading) {
+        log("Binance key connected but spot trading is not enabled on it", "err");
+      } else {
+        log(`Binance connected — spot trading on, withdrawals off${v.ipRestricted ? ", IP-restricted" : ""}`, "ok");
+        const b = await balancesFn({});
+        setLiveBal(b);
+      }
+    } catch (e) {
+      log(`Binance connection failed: ${e instanceof Error ? e.message : "unknown error"}`, "err");
+    } finally { setLiveBusy(false); }
+  };
+
+  const placeLive = async () => {
+    const usd = parseFloat(liveAmt);
+    if (!(usd > 0)) return log("Enter a live order amount", "err");
+    if (!liveConfirm) return log("Tick the confirmation box before sending real money", "err");
+    setLiveBusy(true);
+    try {
+      const r = await orderFn({ data: { asset: liveAsset, side: liveSide, usdt: usd } });
+      log(`LIVE ${r.side} ${r.symbol}: filled ${fmt(r.executedQty, 6)} for $${fmt(r.spentQuote)} (order ${r.orderId}, ${r.status})`, "ok");
+      setLiveConfirm(false);
+      const b = await balancesFn({});
+      setLiveBal(b);
+    } catch (e) {
+      log(`LIVE ORDER FAILED: ${e instanceof Error ? e.message : "unknown error"}`, "err");
+    } finally { setLiveBusy(false); }
+  };
 
   const panel = "border border-border bg-card p-4";
   const h = "mb-3 font-mono text-xs uppercase tracking-widest text-muted-foreground";
@@ -265,6 +347,46 @@ function Console() {
           </div>
         </section>
 
+        {/* Strategy comparison */}
+        <section className={`${panel} lg:col-span-2`}>
+          <h2 className={h}>Strategy comparison · paper trading</h2>
+          <div className="overflow-x-auto">
+            <table className="w-full font-mono text-sm">
+              <thead className="text-xs text-muted-foreground">
+                <tr>
+                  <th className="py-2 text-left">Strategy</th>
+                  <th className="text-right">Net P&L</th>
+                  <th className="text-right">Return</th>
+                  <th className="text-right">Max drawdown</th>
+                  <th className="text-right">Win rate</th>
+                  <th className="text-right">Trades</th>
+                  <th className="text-right">Fees + slippage</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(Object.keys(STRATEGY_LABELS) as StrategyId[]).map((id) => {
+                  const s = strat[id];
+                  const sdd = maxDrawdownPct(s.curve);
+                  return (
+                    <tr key={id} className="border-t border-border">
+                      <td className="py-2">{STRATEGY_LABELS[id]}</td>
+                      <td className={`text-right ${s.pnl >= 0 ? "text-gain" : "text-loss"}`}>{s.pnl >= 0 ? "+" : ""}${fmt(s.pnl)}</td>
+                      <td className={`text-right ${s.pnl >= 0 ? "text-gain" : "text-loss"}`}>{fmt(s.pnl / 100, 2)}%</td>
+                      <td className={`text-right ${sdd > 5 ? "text-loss" : ""}`}>{s.curve.length > 1 ? `${fmt(sdd)}%` : "—"}</td>
+                      <td className="text-right">{s.trades ? `${fmt(winRatePct(s), 1)}%` : "—"}</td>
+                      <td className="text-right">{s.trades}</td>
+                      <td className="text-right text-loss">${fmt(s.fees + s.slip)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Each strategy is scored on the same $10,000 paper account: net return after costs, worst peak-to-trough fall, share of winning trades, and total execution costs paid.
+          </p>
+        </section>
+
         {/* Risk */}
         <section className={panel}>
           <h2 className={h}>Risk controls</h2>
@@ -318,33 +440,72 @@ function Console() {
           </div>
         </section>
 
-        {/* API config */}
+        {/* Live Binance trading */}
         <section className={panel}>
-          <h2 className={h}>Exchange API configuration</h2>
-          <div className="space-y-3 font-mono text-sm">
-            <div className="flex gap-1">
-              {VENUES.map((v) => (
-                <button key={v} className={venue === v ? btn : btnGhost} onClick={() => setVenue(v)}>{v}</button>
-              ))}
+          <h2 className={h}>Live trading · Binance (real money)</h2>
+          {!userEmail ? (
+            <div className="space-y-3 font-mono text-sm">
+              <p className="text-xs text-muted-foreground">Sign in to unlock live trading. Your Binance keys stay on the server and are never shown or logged.</p>
+              <input className={input} type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} />
+              <input className={input} type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} />
+              <div className="flex gap-2">
+                <button className={`${btn} flex-1`} disabled={authBusy} onClick={() => signIn("in")}>Sign in</button>
+                <button className={`${btnGhost} flex-1`} disabled={authBusy} onClick={() => signIn("up")}>Create account</button>
+              </div>
             </div>
-            <input className={input} placeholder="API key" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
-            <input className={input} type="password" placeholder="API secret" value={apiSecret} onChange={(e) => setApiSecret(e.target.value)} />
-            <button className={`${btn} w-full`} onClick={() => {
-              if (!apiKey || !apiSecret) return log("Enter key and secret", "err");
-              setKeys({ ...keys, [venue]: { key: apiKey.slice(0, 4) + "••••", set: true } });
-              setApiKey(""); setApiSecret("");
-              log(`${venue} credentials staged (session only, not stored)`, "ok");
-            }}>Save for session</button>
-            <ul className="space-y-1 text-xs">
-              {VENUES.map((v) => (
-                <li key={v} className="flex justify-between">
-                  <span>{v}</span>
-                  <span className={keys[v].set ? "text-gain" : "text-muted-foreground"}>{keys[v].set ? `staged ${keys[v].key}` : "not configured"}</span>
-                </li>
-              ))}
-            </ul>
-            <p className="text-xs text-muted-foreground">Use trade-only keys with withdrawals disabled. Live order routing is off — all fills are simulated.</p>
-          </div>
+          ) : (
+            <div className="space-y-3 font-mono text-sm">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">{userEmail}</span>
+                <button className={btnGhost} onClick={() => { supabase.auth.signOut(); setKeyStatus(null); setLiveBal(null); }}>Sign out</button>
+              </div>
+              <button className={`${btn} w-full`} disabled={liveBusy} onClick={connectBinance}>
+                {keyStatus?.safeToTrade ? "Re-validate Binance keys" : "Connect & validate Binance keys"}
+              </button>
+              {keyStatus && (
+                <ul className="space-y-1 text-xs">
+                  <li className="flex justify-between"><span>Spot trading</span><span className={keyStatus.spotTrading ? "text-gain" : "text-loss"}>{keyStatus.spotTrading ? "enabled" : "disabled"}</span></li>
+                  <li className="flex justify-between"><span>Withdrawals</span><span className={keyStatus.withdrawalsEnabled ? "text-loss" : "text-gain"}>{keyStatus.withdrawalsEnabled ? "ENABLED — trading blocked" : "disabled ✓"}</span></li>
+                  <li className="flex justify-between"><span>IP restriction</span><span className={keyStatus.ipRestricted ? "text-gain" : "text-muted-foreground"}>{keyStatus.ipRestricted ? "on" : "off (recommended)"}</span></li>
+                </ul>
+              )}
+              {keyStatus?.safeToTrade && (
+                <>
+                  <div className="grid grid-cols-3 gap-2">
+                    <select className={input} value={liveAsset} onChange={(e) => setLiveAsset(e.target.value as Asset)}>
+                      {ASSETS.map((a) => <option key={a}>{a}</option>)}
+                    </select>
+                    <select className={input} value={liveSide} onChange={(e) => setLiveSide(e.target.value as "BUY" | "SELL")}>
+                      <option>BUY</option><option>SELL</option>
+                    </select>
+                    <input className={input} type="number" value={liveAmt} onChange={(e) => setLiveAmt(e.target.value)} placeholder="USDT" />
+                  </div>
+                  <label className="flex items-center gap-2 text-xs">
+                    <input type="checkbox" checked={liveConfirm} onChange={(e) => setLiveConfirm(e.target.checked)} />
+                    I understand this spends real money on Binance (max $250 per order)
+                  </label>
+                  <button className={`${btn} w-full`} disabled={liveBusy || !liveConfirm} onClick={placeLive}>
+                    Send live {liveSide} order
+                  </button>
+                  {liveBal && (
+                    <>
+                      <h3 className={`${h} mt-2`}>Live balances</h3>
+                      <div className="max-h-32 overflow-y-auto text-xs">
+                        {liveBal.map((b) => (
+                          <div key={b.asset} className="flex justify-between border-t border-border py-0.5">
+                            <span>{b.asset}</span><span>{fmt(b.free, 6)}{b.locked > 0 ? ` (+${fmt(b.locked, 6)} locked)` : ""}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+              <p className="text-xs text-muted-foreground">
+                Keys are stored encrypted on the server, never logged, and every order re-checks that withdrawals are disabled. Real trading can lose money — no strategy guarantees profit.
+              </p>
+            </div>
+          )}
         </section>
 
         {/* Log */}
