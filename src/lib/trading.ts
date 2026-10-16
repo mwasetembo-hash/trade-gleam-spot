@@ -42,6 +42,43 @@ export function fillCost(usd: number, feePct: number, slippagePct: number) {
   return { fee, slip, netUsd: usd - fee - slip };
 }
 
+export type StrategyId = "manual" | "arb" | "dca";
+
+export type StrategyStats = {
+  pnl: number;
+  trades: number;
+  wins: number;
+  fees: number;
+  slip: number;
+  curve: number[];
+};
+
+export const emptyStrategyStats = (): StrategyStats => ({
+  pnl: 0, trades: 0, wins: 0, fees: 0, slip: 0, curve: [],
+});
+
+/** Accumulates one filled trade into a strategy's running stats. */
+export function recordTrade(
+  s: StrategyStats,
+  pnl: number,
+  fee: number,
+  slip: number,
+  equity: number,
+): StrategyStats {
+  return {
+    pnl: s.pnl + pnl,
+    trades: s.trades + 1,
+    wins: s.wins + (pnl > 0 ? 1 : 0),
+    fees: s.fees + fee,
+    slip: s.slip + slip,
+    curve: [...s.curve, equity].slice(-2000),
+  };
+}
+
+export function winRatePct(s: StrategyStats): number {
+  return s.trades ? (s.wins / s.trades) * 100 : 0;
+}
+
 /** Largest peak-to-trough fall in an equity curve, in percent. */
 export function maxDrawdownPct(curve: number[]): number {
   let peak = -Infinity, dd = 0;
