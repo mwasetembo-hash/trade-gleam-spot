@@ -274,6 +274,7 @@ function Console() {
               ["maxDailyLossUsd", "Max daily loss ($)"],
               ["minSpreadPct", "Min arb edge (%)"],
               ["feePct", "Fee per leg (%)"],
+              ["slippagePct", "Slippage per leg (%)"],
             ] as const).map(([k, label]) => (
               <label key={k} className="flex items-center justify-between gap-2">
                 <span className="text-muted-foreground">{label}</span>
@@ -286,6 +287,34 @@ function Console() {
               onClick={() => { setLimits({ ...limits, killSwitch: !limits.killSwitch }); setAutoArb(false); setDca(false); log(limits.killSwitch ? "Kill switch released" : "KILL SWITCH ENGAGED", "err"); }}>
               {limits.killSwitch ? "Kill switch ON — release" : "Kill switch"}
             </button>
+          </div>
+        </section>
+
+        {/* Performance */}
+        <section className={panel}>
+          <h2 className={h}>Performance & risk report</h2>
+          <table className="w-full font-mono text-sm">
+            <tbody>
+              {([
+                ["Net P&L", `${pnl >= 0 ? "+" : ""}$${fmt(pnl)}`, pnl >= 0 ? "text-gain" : "text-loss"],
+                ["Return on $10k", `${fmt(((equity - 10000) / 100))}%`, equity >= 10000 ? "text-gain" : "text-loss"],
+                ["Trades filled", String(stats.trades), ""],
+                ["Win rate", stats.trades ? `${fmt((stats.wins / stats.trades) * 100, 1)}%` : "—", ""],
+                ["Fees paid", `$${fmt(stats.fees)}`, "text-loss"],
+                ["Slippage paid", `$${fmt(stats.slip)}`, "text-loss"],
+                ["Max drawdown", `${fmt(dd)}%`, dd > 5 ? "text-loss" : ""],
+                ["Orders blocked", String(stats.rejected), ""],
+              ] as const).map(([k, v, c]) => (
+                <tr key={k} className="border-t border-border">
+                  <td className="py-1 text-muted-foreground">{k}</td>
+                  <td className={`text-right ${c}`}>{v}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-4 font-mono text-xs text-muted-foreground">Daily loss limit used: {fmt(lossUsedPct, 0)}%</div>
+          <div className="mt-1 h-2 border border-border">
+            <div className={`h-full ${lossUsedPct > 75 ? "bg-destructive" : "bg-primary"}`} style={{ width: `${lossUsedPct}%` }} />
           </div>
         </section>
 
